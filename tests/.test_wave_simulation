@@ -1,0 +1,47 @@
+import math
+from pathlib import Path
+import sys
+import unittest
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from wave_simulation import (
+    SimulationConfig,
+    build_grid,
+    run_simulation,
+    stable_time_step,
+    theoretical_wall_arrivals,
+)
+
+
+class WaveSimulationTests(unittest.TestCase):
+    def test_cfl_time_step_is_below_limit(self):
+        config = SimulationConfig()
+        _, _, dx, dy = build_grid(config)
+        dt = stable_time_step(config, dx, dy)
+        c = config.sound_speed_m_s
+        limit = 1.0 / (c * math.sqrt((1.0 / dx**2) + (1.0 / dy**2)))
+        self.assertLess(dt, limit)
+
+    def test_left_wall_is_reached_first(self):
+        config = SimulationConfig()
+        arrivals = theoretical_wall_arrivals(config)
+        first_wall = min(arrivals, key=arrivals.get)
+        self.assertEqual(first_wall, "left")
+        self.assertAlmostEqual(arrivals["left"], config.source_x_m / config.sound_speed_m_s)
+
+    def test_neumann_boundaries_are_applied(self):
+        config = SimulationConfig(duration_s=0.004, snapshot_stride=5)
+        result = run_simulation(config)
+        field = result["snapshots"][-1]
+        np.testing.assert_allclose(field[0, :], field[1, :])
+        np.testing.assert_allclose(field[-1, :], field[-2, :])
+        np.testing.assert_allclose(field[:, 0], field[:, 1])
+        np.testing.assert_allclose(field[:, -1], field[:, -2])
+
+
+if __name__ == "__main__":
+    unittest.main()
