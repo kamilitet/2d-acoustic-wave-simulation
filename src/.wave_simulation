@@ -1,0 +1,336 @@
+"""2D acoustic wave propagation in a rectangular room using FDTD.
+
+The solver integrates the scalar 2D wave equation
+
+    u_tt = c^2 (u_xx + u_yy) + S(x, y, t)
+
+with reflective (zero-normal-gradient / Neumann) boundaries.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import math
+from typing import Dict, Tuple
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
+
+
+@dataclass(frozen=True)
+class SimulationConfig:
+    """Configuration for the acoustic-wave simulation."""
+
+    room_width_m: float = 6.0
+    room_height_m: float = 4.0
+    temperature_c: float = 20.0
+    heat_capacity_ratio: float = 1.4
+    specific_gas_constant: float = 287.05
+
+    target_grid_spacing_m: float = 0.03
+    cfl_safety: float = 0.90
+
+    source_frequency_hz: float = 200.0
+    source_strength: float = 5.0e7
+    source_x_m: float = 1.0
+    source_y_m: float = 2.0
+    source_sigma_m: float = 0.06
+    source_ramp_time_s: float = 0.010
+
+    duration_s: float = 0.060
+    snapshot_stride: int = 15
+
+    @property
+    def sound_speed_m_s(self) -> float:
+        temperature_k = self.temperature_c + 273.15
+        return math.sqrt(
+            self.heat_capacity_ratio
+            * self.specific_gas_constant
+            * temperature_k
+        )
+
+
+def build_grid(config: SimulationConfig) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """Create a grid that spans the room exactly in both directions."""
+
+    nx = int(round(config.room_width_m / config.target_grid_spacing_m)) + 1
+    ny = int(round(config.room_height_m / config.target_grid_spacing_m)) + 1
+
+    x = np.linspace(0.0, config.room_width_m, nx)
+    y = np.linspace(0.0, config.room_height_m, ny)
+    dx = float(x[1] - x[0])
+    dy = float(y[1] - y[0])
+    return x, y, dx, dy
+
+
+def stable_time_step(config: SimulationConfig, dx: float, dy: float) -> float:
+    """Return a 2D CFL-stable time step for potentially unequal dx and dy."""
+
+    c = config.sound_speed_m_s
+    cfl_limit = 1.0 / (c * math.sqrt((1.0 / dx**2) + (1.0 / dy**2)))
+    return config.cfl_safety * cfl_limit
+
+
+def theoretical_wall_arrivals(config: SimulationConfig) -> Dict[str, float]:
+    """Straight-line travel times from the source to each room wall."""
+
+    c = config.sound_speed_m_s
+    distances = {
+        "left": config.source_x_m,
+        "right": config.room_width_m - config.source_x_m,
+        "bottom": config.source_y_m,
+        "top": config.room_height_m - config.source_y_m,
+    }
+    return {wall: distance / c for wall, distance in distances.items()}
+
+
+def _apply_neumann_boundaries(field: np.ndarray) -> None:
+    """Apply zero-normal-gradient boundaries by mirroring adjacent values."""
+
+    field[0, :] = field[1, :]
+    field[-1, :] = field[-2, :]
+    field[:, 0] = field[:, 1]
+    field[:, -1] = field[:, -2]
+
+
+def _gaussian_source_mask(
+    x: np.ndarray,
+    y: np.ndarray,
+    config: SimulationConfig,
+) -> np.ndarray:
+    xx, yy = np.meshgrid(x, y, indexing="ij")
+    distance_sq = (xx - config.source_x_m) ** 2 + (yy - config.source_y_m) ** 2
+    mask = np.exp(-distance_sq / (2.0 * config.source_sigma_m**2))
+    return mask / max(float(mask.max()), 1e-12)
+
+
+def run_simulation(config: SimulationConfig) -> dict:
+    """Run the FDTD simulation and return snapshots plus numerical metadata."""
+
+    x, y, dx, dy = build_grid(config)
+    dt = stable_time_step(config, dx, dy)
+    c = config.sound_speed_m_s
+    nt = int(math.ceil(config.duration_s / dt)) + 1
+
+    coef_x = (c * dt / dx) ** 2
+    coef_y = (c * dt / dy) ** 2
+    source_mask = _gaussian_source_mask(x, y, config)
+
+    u_prev = np.zeros((len(x), len(y)), dtype=np.float64)
+    u_curr = np.zeros_like(u_prev)
+    u_next = np.zeros_like(u_prev)
+    _apply_neumann_boundaries(u_curr)
+
+    snapshots = [u_curr.copy()]
+    times = [0.0]
+
+    arrivals = theoretical_wall_arrivals(config)
+    first_wall = min(arrivals, key=arrivals.get)
+    first_wall_time = arrivals[first_wall]
+    first_wall_step = int(round(first_wall_time / dt))
+    first_wall_snapshot = None
+    first_wall_snapshot_time = None
+
+    for step_index in range(1, nt):
+        center = u_curr[1:-1, 1:-1]
+        d2x = u_curr[2:, 1:-1] - 2.0 * center + u_curr[:-2, 1:-1]
+        d2y = u_curr[1:-1, 2:] - 2.0 * center + u_curr[1:-1, :-2]
+
+        t = step_index * dt
+        ramp = (
+            min(1.0, t / config.source_ramp_time_s)
+            if config.source_ramp_time_s > 0.0
+            else 1.0
+        )
+        source_t = (
+            config.source_strength
+            * math.sin(2.0 * math.pi * config.source_frequency_hz * t)
+            * ramp
+        )
+
+        u_next[1:-1, 1:-1] = (
+            2.0 * center
+            - u_prev[1:-1, 1:-1]
+            + coef_x * d2x
+            + coef_y * d2y
+            + (dt**2) * source_t * source_mask[1:-1, 1:-1]
+        )
+        _apply_neumann_boundaries(u_next)
+
+        u_prev, u_curr, u_next = u_curr, u_next, u_prev
+        u_next.fill(0.0)
+
+        if step_index == first_wall_step:
+            first_wall_snapshot = u_curr.copy()
+            first_wall_snapshot_time = t
+
+        if step_index % config.snapshot_stride == 0 or step_index == nt - 1:
+            snapshots.append(u_curr.copy())
+            times.append(t)
+
+    snapshots_array = np.stack(snapshots)
+    if first_wall_snapshot is None:
+        first_wall_snapshot = u_curr.copy()
+        first_wall_snapshot_time = (nt - 1) * dt
+
+    return {
+        "x": x,
+        "y": y,
+        "dx": dx,
+        "dy": dy,
+        "dt": dt,
+        "steps": nt,
+        "times": np.asarray(times),
+        "snapshots": snapshots_array,
+        "sound_speed_m_s": c,
+        "wall_arrival_times_s": arrivals,
+        "first_wall": first_wall,
+        "first_wall_snapshot": first_wall_snapshot,
+        "first_wall_snapshot_time_s": first_wall_snapshot_time,
+    }
+
+
+def _symmetric_display_limit(snapshots: np.ndarray) -> float:
+    values = np.abs(snapshots)
+    limit = float(np.percentile(values, 99.7))
+    return max(limit, 1e-10)
+
+
+def save_animation(
+    result: dict,
+    config: SimulationConfig,
+    output_path: str | Path,
+    fps: int = 20,
+) -> Path:
+    """Save the simulated pressure field as an animated GIF."""
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    snapshots = result["snapshots"]
+    times = result["times"]
+    limit = _symmetric_display_limit(snapshots)
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.7))
+    image = ax.imshow(
+        snapshots[0].T,
+        origin="lower",
+        extent=[0, config.room_width_m, 0, config.room_height_m],
+        interpolation="bilinear",
+        vmin=-limit,
+        vmax=limit,
+        cmap="RdBu_r",
+        aspect="equal",
+    )
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label="Relative pressure")
+    ax.plot(
+        config.source_x_m,
+        config.source_y_m,
+        marker="s",
+        markersize=7,
+        markerfacecolor="none",
+        markeredgecolor="black",
+        label="Source",
+    )
+    title = ax.set_title("2D acoustic wave propagation — t = 0.00 ms")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.legend(loc="upper right")
+
+    def update(frame_index: int):
+        image.set_data(snapshots[frame_index].T)
+        title.set_text(
+            f"2D acoustic wave propagation — t = {times[frame_index] * 1e3:.2f} ms"
+        )
+        return image, title
+
+    animation = FuncAnimation(
+        fig,
+        update,
+        frames=len(snapshots),
+        interval=1000.0 / fps,
+        blit=False,
+    )
+    animation.save(output_path, writer=PillowWriter(fps=fps))
+    plt.close(fig)
+    return output_path
+
+
+def save_snapshot_near_first_wall_hit(
+    result: dict,
+    config: SimulationConfig,
+    output_path: str | Path,
+) -> Path:
+    """Save the frame closest to the theoretical first wall-arrival time."""
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    arrivals = result["wall_arrival_times_s"]
+    first_wall = result["first_wall"]
+    first_time = arrivals[first_wall]
+    snapshot_time = result["first_wall_snapshot_time_s"]
+    snapshot = result["first_wall_snapshot"]
+    limit = _symmetric_display_limit(result["snapshots"])
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.7))
+    image = ax.imshow(
+        snapshot.T,
+        origin="lower",
+        extent=[0, config.room_width_m, 0, config.room_height_m],
+        interpolation="bilinear",
+        vmin=-limit,
+        vmax=limit,
+        cmap="RdBu_r",
+        aspect="equal",
+    )
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label="Relative pressure")
+    ax.plot(
+        config.source_x_m,
+        config.source_y_m,
+        marker="s",
+        markersize=7,
+        markerfacecolor="none",
+        markeredgecolor="black",
+        label="Source",
+    )
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_title(
+        f"First wall arrival: {first_wall} wall (theory {first_time * 1e3:.2f} ms, "
+        f"frame {snapshot_time * 1e3:.2f} ms)"
+    )
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def print_summary(result: dict) -> None:
+    """Print key numerical settings and theoretical wall-arrival times."""
+
+    print(f"Sound speed: {result['sound_speed_m_s']:.2f} m/s")
+    print(f"Grid spacing: dx={result['dx']:.5f} m, dy={result['dy']:.5f} m")
+    print(f"Time step: {result['dt']:.8f} s")
+    print(f"Simulation steps: {result['steps']}")
+    print("Theoretical source-to-wall travel times:")
+    for wall, time_s in result["wall_arrival_times_s"].items():
+        print(f"  {wall:>6}: {time_s * 1e3:6.2f} ms")
+
+
+if __name__ == "__main__":
+    config = SimulationConfig()
+    result = run_simulation(config)
+    print_summary(result)
+
+    repository_root = Path(__file__).resolve().parents[1]
+    save_animation(result, config, repository_root / "assets" / "room_wave.gif")
+    save_snapshot_near_first_wall_hit(
+        result,
+        config,
+        repository_root / "assets" / "first_wall_arrival.png",
+    )
+    print("Saved assets/room_wave.gif and assets/first_wall_arrival.png")
